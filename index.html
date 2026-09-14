@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#070B12">
+<meta name="description" content="SNICK — one swipe, every shard counts.">
+<title>SNICK</title>
+<style>
+  :root{
+    --ink:#070B12;
+    --pane:#0E1622;
+    --pane-hi:#16223300;
+    --rule:#1E2E44;
+    --blade:#E9F4FF;
+    --danger:#E8455F;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{
+    margin:0;padding:0;height:100%;width:100%;
+    background:var(--ink);
+    overflow:hidden;overscroll-behavior:none;
+    touch-action:none;
+    -webkit-user-select:none;user-select:none;
+    font-family:"SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+    color:var(--blade);
+  }
+  #stage{position:fixed;inset:0;display:block;touch-action:none;}
+  #overlay{
+    position:fixed;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;
+    padding:max(24px,env(safe-area-inset-top)) 28px max(24px,env(safe-area-inset-bottom));
+    background:radial-gradient(120% 80% at 50% 40%, rgba(14,22,34,.86), rgba(7,11,18,.97));
+    backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);
+    text-align:center;
+  }
+  #overlay.hidden{display:none;}
+  .mark{
+    font-size:clamp(52px,17vw,104px);
+    font-weight:800;letter-spacing:.14em;margin:0 0 6px -0.14em;
+    line-height:.92;
+  }
+  .sub{font-size:15px;line-height:1.5;color:#7E93AE;margin:0 0 34px;max-width:19rem;font-weight:400;}
+  .how{font-size:14px;line-height:1.75;color:#9FB3CC;margin:0 0 34px;max-width:19rem;}
+  .how b{color:var(--blade);font-weight:600;}
+  .go{
+    font-size:13px;letter-spacing:.22em;color:#7E93AE;font-weight:600;
+    animation:pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
+  @media (prefers-reduced-motion:reduce){.go{animation:none;opacity:.8}}
+  .score-big{font-size:clamp(60px,20vw,112px);font-weight:800;line-height:1;margin:0;letter-spacing:-.02em;}
+  .score-cap{font-size:13px;letter-spacing:.2em;color:#7E93AE;margin:10px 0 2px;font-weight:600;}
+  .stats{display:flex;gap:30px;margin:26px 0 34px;}
+  .stat{min-width:74px;}
+  .stat .v{font-size:23px;font-weight:700;line-height:1.2;}
+  .stat .k{font-size:11px;letter-spacing:.14em;color:#6C8099;margin-top:5px;font-weight:600;}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="overlay"></div>
+
+<script>
+(function(){
+"use strict";
+
+/* ============================================================
+   SNICK — prototype
+   Locked ruleset:
+     6 x 12 board, 1/8-cell sub-grid, convex polygon pieces
+     Swipe casts an infinite line; every piece it crosses splits
+     Pieces under 0.5 cell of area shatter into Dust
+     Same-colour pieces that touch weld into one rigid body
+     A welded body clears at 4.0 cells of area
+     Fresh cut edges stay hot 0.4s and cannot weld
+     Blade: 3 charges, +1 per 1.4s, +1 per clear, +2 on a chain
+   ============================================================ */
+
+/* ---------- constants ---------- */
+var COLS = 6, ROWS = 12, SUB = 8, SUBW = COLS * SUB;
+var SNAP = 16;                 // cut vertices snap to 1/16 cell
+var EPS = 1e-4, TOUCH = 0.035; // contact tolerance
+var SLIVER = 0.5;              // area below this becomes Dust
+var CLEAR_AREA = 4.0;          // welded area needed to clear
+var HOT_MS = 400;
+var BLADE_MAX = 3, BLADE_REGEN = 1400;
+var CHUTE = 2.2;               // cells of visible space above the board
+var ANGLES = 64;               // swipe angle quantisation
+
+var PALETTE = [
+  { fill:'#F2A33C', edge:'#FFD79A', glyph:'circle'   },
+  { fill:'#35C489', edge:'#A6F0D0', glyph:'triangle' },
+  { fill:'#4B8FF7', edge:'#B5D4FF', glyph:'square'   },
+  { fill:'#E0559B', edge:'#FFBADC', glyph:'diamond'  },
+  { fill:'#9B6BF2', edge:'#D6C2FF', glyph:'cross'    }
+];
+
+/* ---------- geometry ---------- */
+
+function polyArea(p){
+  var a = 0;
+  for (var i = 0, n = p.length; i < n; i++){
+    var q = p[(i + 1) % n];
+    a += p[i].x * q.y - q.x * p[i].y;
+  }
+  return Math.abs(a) / 2;
+}
+
+function polyBounds(p){
+  var b = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+  for (var i = 0; i < p.length; i++){
+    var v = p[i];
+    if (v.x < b.minX) b.minX = v.x;
+    if (v.x > b.maxX) b.maxX = v.x;
+    if (v.y < b.minY) b.minY = v.y;
+    if (v.y > b.maxY) b.maxY = v.y;
+  }
+  return b;
+}
+
+function tidy(p){
+  // snap to the sub-grid, then drop duplicate and collinear-degenerate points
+  var out = [];
+  for (var i = 0; i < p.length; i++){
+    var x = Math.round(p[i].x * SNAP) / SNAP;
+    var y = Math.round(p[i].y * SNAP) / SNAP;
+    var prev = out[out.length - 1];
+    if (prev && Math.abs(prev.x - x) < 1e-6 && Math.abs(prev.y - y) < 1e-6) continue;
+    out.push({ x: x, y: y });
+  }
+  if (out.length > 1){
+    var f = out[0], l = out[out.length - 1];
+    if (Math.abs(f.x - l.x) < 1e-6 && Math.abs(f.y - l.y) < 1e-6) out.pop();
+  }
+  return out;
+}
+
+// Keep the half-plane on one side of the line through (ox,oy) with direction (dx,dy).
+function clipHalf(poly, ox, oy, dx, dy, keep){
+  var out = [], n = poly.length;
+  if (!n) return out;
+  function side(p){ return (dx * (p.y - oy) - dy * (p.x - ox)) * keep; }
+  for (var i = 0; i < n; i++){
+    var a = poly[i], b = poly[(i + 1) % n];
+    var sa = side(a), sb = side(b);
+    if (sa >= -EPS) out.push({ x: a.x, y: a.y });
+    if ((sa > EPS && sb < -EPS) || (sa < -EPS && sb > EPS)){
+      var t = sa / (sa - sb);
+      out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  out = tidy(out);
+  return out.length >= 3 ? out : [];
+}
+
+// Vertical extent of a polygon at each sub-column it covers.
+function partProfile(poly, top, bot, has){
+  var b = polyBounds(poly);
+  var i0 = Math.max(0, Math.floor(b.minX * SUB - 1));
+  var i1 = Math.min(SUBW - 1, Math.ceil(b.maxX * SUB + 1));
+  var hit = false;
+  for (var i = i0; i <= i1; i++){
+    var xc = (i + 0.5) / SUB;
+    if (xc < b.minX - EPS || xc > b.maxX + EPS) continue;
+    var lo = Infinity, hi = -Infinity, found = false;
+    for (var k = 0, n = poly.length; k < n; k++){
+      var a = poly[k], c = poly[(k + 1) % n];
+      if (Math.abs(a.x - c.x) < 1e-9){
+        if (Math.abs(a.x - xc) < 0.5 / SUB){
+          if (a.y < lo) lo = a.y; if (a.y > hi) hi = a.y;
+          if (c.y < lo) lo = c.y; if (c.y > hi) hi = c.y;
+          found = true;
+        }
+        continue;
+      }
+      if ((a.x - xc) * (c.x - xc) <= 0){
+        var t = (xc - a.x) / (c.x - a.x);
+        var y = a.y + (c.y - a.y) * t;
+        if (y < lo) lo = y; if (y > hi) hi = y;
+        found = true;
+      }
+    }
+    if (found){
+      hit = true;
+      if (lo < top[i]) top[i] = lo;
+      if (hi > bot[i]) bot[i] = hi;
+      has[i] = 1;
+    }
+  }
+  if (!hit){
+    // very thin shard: fall back to the column under its centroid
+    var i2 = Math.max(0, Math.min(SUBW - 1, Math.floor(((b.minX + b.maxX) / 2) * SUB)));
+    if (b.minY < top[i2]) top[i2] = b.minY;
+    if (b.maxY > bot[i2]) bot[i2] = b.maxY;
+    has[i2] = 1;
+  }
+}
+
+/* ---------- bodies ---------- */
+
+var nextId = 1;
+
+function makeBody(color, parts){
+  var b = {
+    id: nextId++, color: color, parts: parts,
+    top: new Float64Array(SUBW), bot: new Float64Array(SUBW), has: new Uint8Array(SUBW),
+    area: 0, minX: 0, maxX: 0, minY: 0, maxY: 0,
+    settled: false, hot: 0, flash: 0
+  };
+  refresh(b);
+  return b;
+}
+
+function refresh(b){
+  b.top.fill(Infinity); b.bot.fill(-Infinity); b.has.fill(0);
+  b.area = 0;
+  b.minX = Infinity; b.maxX = -Infinity; b.minY = Infinity; b.maxY = -Infinity;
+  for (var i = 0; i < b.parts.length; i++){
+    var p = b.parts[i];
+    b.area += polyArea(p);
+    partProfile(p, b.top, b.bot, b.has);
+    var bb = polyBounds(p);
+    if (bb.minX < b.minX) b.minX = bb.minX;
+    if (bb.maxX > b.maxX) b.maxX = bb.maxX;
+    if (bb.minY < b.minY) b.minY = bb.minY;
+    if (bb.maxY > b.maxY) b.maxY = bb.maxY;
+  }
+}
+
+function translate(b, dy){
+  for (var i = 0; i < b.parts.length; i++){
+    var p = b.parts[i];
+    for (var k = 0; k < p.length; k++) p[k].y += dy;
+  }
+  for (var j = 0; j < SUBW; j++){
+    if (b.has[j]){ b.top[j] += dy; b.bot[j] += dy; }
+  }
+  b.minY += dy; b.maxY += dy;
+}
+
+function rect(x, y, w, h){
+  return [{x:x,y:y},{x:x+w,y:y},{x:x+w,y:y+h},{x:x,y:y+h}];
+}
+
+/* ---------- world ---------- */
+
+var W = {
+  bodies: [], score: 0, dust: 0, chain: 0, blade: BLADE_MAX,
+  speed: 2.0, spawnEvery: 1000, spawnAt: 0, colors: 3,
+  running: false, over: false, t: 0, best: 0, cleared: 0, cuts: 0
+};
+
+function reset(){
+  W.bodies = []; W.score = 0; W.dust = 0; W.chain = 0; W.blade = BLADE_MAX;
+  W.speed = 2.0; W.spawnEvery = 1000; W.spawnAt = 0; W.colors = 3;
+  W.over = false; W.running = true; W.t = 0; W.cleared = 0; W.cuts = 0;
+  nextId = 1; sparks.length = 0;
+}
+
+function spawn(){
+  var c = (Math.random() * W.colors) | 0;
+  var col = (Math.random() * COLS) | 0;
+  var r = Math.random(), part;
+  if (r < 0.60)      part = rect(col, -CHUTE + 0.2, 1, 1);
+  else if (r < 0.80) part = rect(Math.min(col, COLS - 2), -CHUTE + 0.2, 2, 1);
+  else               part = rect(col, -CHUTE + 0.2, 1, 2);
+  W.bodies.push(makeBody(c, [part]));
+}
+
+function buckets(){
+  var cols = new Array(SUBW);
+  for (var i = 0; i < SUBW; i++) cols[i] = [];
+  for (var k = 0; k < W.bodies.length; k++){
+    var b = W.bodies[k];
+    for (var j = 0; j < SUBW; j++){
+      if (b.has[j]) cols[j].push(b);
+    }
+  }
+  return cols;
+}
+
+// How far this body can fall, and whether what stops it is solid (floor or settled).
+function fallRoom(b, cols){
+  var d = Infinity, solid = false;
+  for (var i = 0; i < SUBW; i++){
+    if (!b.has[i]) continue;
+    var floor = ROWS - b.bot[i];
+    if (floor < d){ d = floor; solid = true; }
+    var list = cols[i];
+    for (var k = 0; k < list.length; k++){
+      var o = list[k];
+      if (o === b) continue;
+      if (o.top[i] < b.bot[i] - EPS) continue;   // that body is above us
+      var gap = o.top[i] - b.bot[i];
+      if (gap < d){ d = gap; solid = o.settled; }
+      else if (Math.abs(gap - d) < EPS && o.settled) solid = true;
+    }
+  }
+  return { d: Math.max(0, d), solid: solid };
+}
+
+function physics(dt){
+  var cols = buckets();
+  var step = W.speed * dt;
+  var landed = false;
+  for (var k = 0; k < W.bodies.length; k++){
+    var b = W.bodies[k];
+    if (b.settled) continue;
+    var r = fallRoom(b, cols);
+    if (r.d <= EPS){
+      if (r.solid){ b.settled = true; landed = true; }
+      continue;
+    }
+    translate(b, Math.min(step, r.d));
+    if (r.d - step <= EPS && r.solid){ b.settled = true; landed = true; }
+  }
+  return landed;
+}
+
+function touching(a, b){
+  if (a.maxX < b.minX - TOUCH || b.maxX < a.minX - TOUCH) return false;
+  if (a.maxY < b.minY - TOUCH || b.maxY < a.minY - TOUCH) return false;
+  for (var i = 0; i < SUBW; i++){
+    if (!a.has[i] || !b.has[i]) continue;
+    if (Math.abs(a.bot[i] - b.top[i]) < TOUCH) return true;
+    if (Math.abs(b.bot[i] - a.top[i]) < TOUCH) return true;
+    // overlapping in the same column counts as contact too
+    if (a.top[i] < b.bot[i] + TOUCH && b.top[i] < a.bot[i] + TOUCH) return true;
+  }
+  var side = Math.abs(a.maxX - b.minX) < TOUCH || Math.abs(b.maxX - a.minX) < TOUCH;
+  if (side){
+    var ov = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+    if (ov > TOUCH) return true;
+  }
+  return false;
+}
+
+function weld(now){
+  var pool = [];
+  for (var i = 0; i < W.bodies.length; i++){
+    var b = W.bodies[i];
+    if (b.settled && now >= b.hot) pool.push(b);
+  }
+  var parent = {};
+  function find(x){ while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  for (var p = 0; p < pool.length; p++) parent[pool[p].id] = pool[p].id;
+
+  var merged = false;
+  for (var a = 0; a < pool.length; a++){
+    for (var c = a + 1; c < pool.length; c++){
+      if (pool[a].color !== pool[c].color) continue;
+      var ra = find(pool[a].id), rc = find(pool[c].id);
+      if (ra === rc) continue;
+      if (touching(pool[a], pool[c])){ parent[rc] = ra; merged = true; }
+    }
+  }
+  if (!merged) return false;
+
+  var groups = {};
+  for (var g = 0; g < pool.length; g++){
+    var root = find(pool[g].id);
+    (groups[root] || (groups[root] = [])).push(pool[g]);
+  }
+  var keep = [];
+  for (var m = 0; m < W.bodies.length; m++){
+    var bb = W.bodies[m];
+    if (!(bb.settled && now >= bb.hot)) { keep.push(bb); continue; }
+    var rt = find(bb.id);
+    if (groups[rt] && groups[rt][0] === bb){
+      var list = groups[rt];
+      if (list.length === 1){ keep.push(bb); continue; }
+      var parts = [];
+      for (var q = 0; q < list.length; q++) parts = parts.concat(list[q].parts);
+      var nb = makeBody(bb.color, parts);
+      nb.settled = true;
+      keep.push(nb);
+    }
+  }
+  W.bodies = keep;
+  return true;
+}
+
+var sparks = [];
+
+function burst(b){
+  var n = Math.min(26, 8 + Math.round(b.area * 4));
+  for (var i = 0; i < n; i++){
+    var p = b.parts[(Math.random() * b.parts.length) | 0];
+    var bb = polyBounds(p);
+    sparks.push({
+      x: bb.minX + Math.random() * (bb.maxX - bb.minX),
+      y: bb.minY + Math.random() * (bb.maxY - bb.minY),
+      vx: (Math.random() - 0.5) * 5,
+      vy: (Math.random() - 0.5) * 5 - 1.5,
+      life: 1, color: b.color
+    });
+  }
+}
+
+function resolveClears(){
+  var any = false;
+  for (var i = W.bodies.length - 1; i >= 0; i--){
+    var b = W.bodies[i];
+    if (!b.settled || b.area < CLEAR_AREA - EPS) continue;
+    any = true;
+    W.cleared++;
+    burst(b);
+    W.bodies.splice(i, 1);
+  }
+  if (!any) return false;
+  W.chain++;
+  W.score += Math.round(CLEAR_AREA * 10 * W.chain);
+  W.blade = Math.min(BLADE_MAX, W.blade + (W.chain > 1 ? 2 : 1));
+  sfx.clear(W.chain);
+  for (var k = 0; k < W.bodies.length; k++) W.bodies[k].settled = false;
+  return true;
+}
+
+/* ---------- cutting ---------- */
+
+function quantAngle(dx, dy){
+  var a = Math.atan2(dy, dx);
+  var step = Math.PI * 2 / ANGLES;
+  a = Math.round(a / step) * step;
+  return { dx: Math.cos(a), dy: Math.sin(a) };
+}
+
+function wouldCut(ox, oy, dx, dy){
+  var hits = [];
+  for (var i = 0; i < W.bodies.length; i++){
+    var b = W.bodies[i], pos = false, neg = false;
+    for (var k = 0; k < b.parts.length && !(pos && neg); k++){
+      var p = b.parts[k];
+      for (var j = 0; j < p.length; j++){
+        var s = dx * (p[j].y - oy) - dy * (p[j].x - ox);
+        if (s > EPS) pos = true; else if (s < -EPS) neg = true;
+      }
+    }
+    if (pos && neg) hits.push(b);
+  }
+  return hits;
+}
+
+function cut(ox, oy, dx, dy, now){
+  if (W.blade < 1) { sfx.dud(); return false; }
+  var q = quantAngle(dx, dy);
+  dx = q.dx; dy = q.dy;
+  var next = [], didCut = false;
+
+  for (var i = 0; i < W.bodies.length; i++){
+    var b = W.bodies[i];
+    var A = [], B = [], split = false;
+
+    for (var k = 0; k < b.parts.length; k++){
+      var p = b.parts[k];
+      var pa = clipHalf(p, ox, oy, dx, dy, 1);
+      var pb = clipHalf(p, ox, oy, dx, dy, -1);
+      var aa = pa.length ? polyArea(pa) : 0;
+      var ab = pb.length ? polyArea(pb) : 0;
+      if (aa > EPS && ab > EPS) split = true;
+
+      if (aa > EPS){ if (aa < SLIVER){ W.dust++; W.score += 1; } else A.push(pa); }
+      if (ab > EPS){ if (ab < SLIVER){ W.dust++; W.score += 1; } else B.push(pb); }
+      if (aa <= EPS && ab <= EPS){ W.dust++; }
+    }
+
+    if (!split){ next.push(b); continue; }
+    didCut = true;
+
+    if (A.length){
+      var na = makeBody(b.color, A);
+      na.settled = false; na.hot = now + HOT_MS; na.flash = 1;
+      next.push(na);
+    }
+    if (B.length){
+      var nb = makeBody(b.color, B);
+      nb.settled = false; nb.hot = now + HOT_MS; nb.flash = 1;
+      next.push(nb);
+    }
+  }
+
+  if (!didCut) return false;
+  W.bodies = next;
+  W.blade -= 1;
+  W.cuts++;
+  for (var m = 0; m < W.bodies.length; m++) W.bodies[m].settled = false;
+  sfx.snick();
+  return true;
+}
+
+/* ---------- audio ---------- */
+
+var sfx = (function(){
+  var ctx = null;
+  function on(){
+    if (ctx) return ctx;
+    if (typeof window === 'undefined') return null;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    ctx = new AC();
+    return ctx;
+  }
+  function noise(dur, f0, f1, gain){
+    var c = on(); if (!c) return;
+    if (c.state === 'suspended') c.resume();
+    var n = Math.floor(c.sampleRate * dur);
+    var buf = c.createBuffer(1, n, c.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    var src = c.createBufferSource(); src.buffer = buf;
+    var flt = c.createBiquadFilter(); flt.type = 'bandpass';
+    flt.frequency.setValueAtTime(f0, c.currentTime);
+    flt.frequency.exponentialRampToValueAtTime(f1, c.currentTime + dur);
+    flt.Q.value = 3;
+    var g = c.createGain();
+    g.gain.setValueAtTime(gain, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    src.connect(flt); flt.connect(g); g.connect(c.destination);
+    src.start();
+  }
+  function tone(freq, dur, gain){
+    var c = on(); if (!c) return;
+    if (c.state === 'suspended') c.resume();
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = 'triangle'; o.frequency.value = freq;
+    g.gain.setValueAtTime(gain, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur);
+  }
+  return {
+    unlock: function(){ var c = on(); if (c && c.state === 'suspended') c.resume(); },
+    snick:  function(){ noise(0.07, 5200, 1400, 0.16); },
+    dud:    function(){ tone(110, 0.07, 0.05); },
+    clear:  function(ch){ tone(440 * Math.pow(1.26, Math.min(ch, 6) - 1), 0.16, 0.12); },
+    over:   function(){ tone(196, 0.5, 0.12); }
+  };
+})();
+
+/* ---------- storage (best score) ---------- */
+
+var store = (function(){
+  var mem = 0;
+  return {
+    get: function(){
+      try { return parseInt(localStorage.getItem('snick.best') || '0', 10) || 0; }
+      catch (e) { return mem; }
+    },
+    set: function(v){
+      mem = v;
+      try { localStorage.setItem('snick.best', String(v)); } catch (e) {}
+    }
+  };
+})();
+
+/* ---------- boot / render / input ---------- */
+
+function boot(){
+  var cv = document.getElementById('stage');
+  var ov = document.getElementById('overlay');
+  var g  = cv.getContext('2d');
+  var dpr = 1, VW = 0, VH = 0;
+  var cell = 0, ox0 = 0, oy0 = 0;     // board transform
+  var drag = null;
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  W.best = store.get();
+
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    var r = cv.getBoundingClientRect();
+    VW = Math.max(1, Math.round(r.width  || window.innerWidth));
+    VH = Math.max(1, Math.round(r.height || window.innerHeight));
+    cv.width  = Math.round(VW * dpr);
+    cv.height = Math.round(VH * dpr);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var padX = 14;
+    var safeTop = 46, safeBot = 34;
+    var availW = VW - padX * 2;
+    var availH = VH - safeTop - safeBot;
+    var totalRows = ROWS + CHUTE;
+    cell = Math.min(availW / COLS, availH / totalRows);
+    ox0 = (VW - cell * COLS) / 2;
+    oy0 = safeTop + (availH - cell * totalRows) / 2 + cell * CHUTE;
+  }
+
+  function toBoard(px, py){ return { x: (px - ox0) / cell, y: (py - oy0) / cell }; }
+  function toScreenX(bx){ return ox0 + bx * cell; }
+  function toScreenY(by){ return oy0 + by * cell; }
+
+  /* ----- screens ----- */
+
+  function showStart(){
+    ov.className = '';
+    ov.innerHTML =
+      '<h1 class="mark">SNICK</h1>' +
+      '<p class="sub">One swipe. Every shard counts.</p>' +
+      '<p class="how">Swipe to cut a line across the board. Same colours that touch fuse together. ' +
+      'Fuse <b>four cells</b> of one colour and it clears. Shards too small to keep turn to dust.</p>' +
+      '<p class="go">TAP TO PLAY</p>';
+  }
+
+  function showOver(){
+    ov.className = '';
+    var best = W.score > W.best;
+    if (best){ W.best = W.score; store.set(W.best); }
+    ov.innerHTML =
+      '<p class="score-cap">' + (best ? 'NEW BEST' : 'SCORE') + '</p>' +
+      '<p class="score-big">' + W.score + '</p>' +
+      '<div class="stats">' +
+        '<div class="stat"><div class="v">' + W.cleared + '</div><div class="k">CLEARS</div></div>' +
+        '<div class="stat"><div class="v">' + W.cuts + '</div><div class="k">CUTS</div></div>' +
+        '<div class="stat"><div class="v">' + W.dust + '</div><div class="k">DUST</div></div>' +
+      '</div>' +
+      '<p class="go">TAP TO PLAY AGAIN</p>';
+  }
+
+  function hideOverlay(){ ov.className = 'hidden'; ov.innerHTML = ''; }
+
+  /* ----- drawing ----- */
+
+  function glyph(kind, x, y, r){
+    g.beginPath();
+    if (kind === 'circle'){ g.arc(x, y, r, 0, Math.PI * 2); }
+    else if (kind === 'square'){ g.rect(x - r * 0.8, y - r * 0.8, r * 1.6, r * 1.6); }
+    else if (kind === 'triangle'){
+      g.moveTo(x, y - r); g.lineTo(x + r * 0.92, y + r * 0.72); g.lineTo(x - r * 0.92, y + r * 0.72); g.closePath();
+    } else if (kind === 'diamond'){
+      g.moveTo(x, y - r); g.lineTo(x + r, y); g.lineTo(x, y + r); g.lineTo(x - r, y); g.closePath();
+    } else {
+      g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
+      g.moveTo(x + r, y - r); g.lineTo(x - r, y + r);
+    }
+  }
+
+  function drawBoard(){
+    var bx = toScreenX(0), by = toScreenY(0);
+    var bw = cell * COLS, bh = cell * ROWS;
+    var chuteTop = toScreenY(-CHUTE);
+
+    // chute
+    var cg = g.createLinearGradient(0, chuteTop, 0, by);
+    cg.addColorStop(0, 'rgba(14,22,34,0)');
+    cg.addColorStop(1, 'rgba(14,22,34,.55)');
+    g.fillStyle = cg;
+    g.fillRect(bx, chuteTop, bw, by - chuteTop);
+
+    // pane
+    g.fillStyle = '#0E1622';
+    g.fillRect(bx, by, bw, bh);
+
+    // column rules
+    g.strokeStyle = 'rgba(30,46,68,.9)';
+    g.lineWidth = 1;
+    for (var c = 1; c < COLS; c++){
+      var x = Math.round(toScreenX(c)) + 0.5;
+      g.beginPath(); g.moveTo(x, by); g.lineTo(x, by + bh); g.stroke();
+    }
+    g.strokeStyle = 'rgba(30,46,68,.45)';
+    for (var r = 1; r < ROWS; r++){
+      var y = Math.round(toScreenY(r)) + 0.5;
+      g.beginPath(); g.moveTo(bx, y); g.lineTo(bx + bw, y); g.stroke();
+    }
+
+    // frame
+    g.strokeStyle = 'rgba(52,78,110,.85)';
+    g.lineWidth = 1.5;
+    g.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+
+    // danger line
+    g.save();
+    g.strokeStyle = 'rgba(232,69,95,.75)';
+    g.lineWidth = 1.5;
+    g.setLineDash([5, 5]);
+    g.beginPath(); g.moveTo(bx, by + 0.5); g.lineTo(bx + bw, by + 0.5); g.stroke();
+    g.restore();
+  }
+
+  function drawBody(b, now, highlight){
+    var pal = PALETTE[b.color];
+    var ready = b.area / CLEAR_AREA;
+    var hot = now < b.hot;
+
+    for (var k = 0; k < b.parts.length; k++){
+      var p = b.parts[k];
+      g.beginPath();
+      g.moveTo(toScreenX(p[0].x), toScreenY(p[0].y));
+      for (var i = 1; i < p.length; i++) g.lineTo(toScreenX(p[i].x), toScreenY(p[i].y));
+      g.closePath();
+
+      g.fillStyle = pal.fill;
+      g.globalAlpha = 0.92;
+      g.fill();
+      g.globalAlpha = 1;
+
+      // top-left sheen
+      g.save();
+      g.clip();
+      var bb = polyBounds(p);
+      var lg = g.createLinearGradient(toScreenX(bb.minX), toScreenY(bb.minY), toScreenX(bb.maxX), toScreenY(bb.maxY));
+      lg.addColorStop(0, 'rgba(255,255,255,.26)');
+      lg.addColorStop(0.55, 'rgba(255,255,255,0)');
+      g.fillStyle = lg;
+      g.fillRect(toScreenX(bb.minX), toScreenY(bb.minY),
+                 (bb.maxX - bb.minX) * cell, (bb.maxY - bb.minY) * cell);
+      g.restore();
+
+      g.strokeStyle = hot ? '#FFFFFF' : pal.edge;
+      g.lineWidth = hot ? 2 : (ready >= 0.75 ? 2 : 1);
+      g.globalAlpha = hot ? 0.95 : (0.35 + Math.min(ready, 1) * 0.55);
+      g.stroke();
+      g.globalAlpha = 1;
+
+      if (highlight){
+        g.strokeStyle = '#E9F4FF';
+        g.lineWidth = 2;
+        g.stroke();
+      }
+
+      // colourblind glyph on the biggest part
+      var a = polyArea(p);
+      if (a > 0.55){
+        var cx = toScreenX((bb.minX + bb.maxX) / 2);
+        var cy = toScreenY((bb.minY + bb.maxY) / 2);
+        var rr = Math.min(cell * 0.17, Math.sqrt(a) * cell * 0.20);
+        g.save();
+        g.globalAlpha = 0.5;
+        g.strokeStyle = 'rgba(8,12,20,.9)';
+        g.lineWidth = Math.max(1.5, rr * 0.34);
+        g.lineCap = 'round';
+        glyph(pal.glyph, cx, cy, rr);
+        g.stroke();
+        g.restore();
+      }
+    }
+  }
+
+  function drawSparks(dt){
+    for (var i = sparks.length - 1; i >= 0; i--){
+      var s = sparks[i];
+      s.life -= dt * 1.7;
+      if (s.life <= 0){ sparks.splice(i, 1); continue; }
+      s.vy += dt * 9;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      g.globalAlpha = Math.max(0, s.life) * 0.85;
+      g.fillStyle = PALETTE[s.color].edge;
+      var sz = 2 + s.life * 3;
+      g.fillRect(toScreenX(s.x) - sz / 2, toScreenY(s.y) - sz / 2, sz, sz);
+    }
+    g.globalAlpha = 1;
+  }
+
+  function drawHUD(){
+    var top = Math.max(16, (window.screen && window.innerHeight < 700 ? 16 : 22));
+    g.font = '700 26px -apple-system, system-ui, sans-serif';
+    g.fillStyle = '#E9F4FF';
+    g.textAlign = 'left';
+    g.textBaseline = 'alphabetic';
+    g.fillText(String(W.score), ox0, top + 14);
+
+    if (W.chain > 1){
+      g.font = '700 12px -apple-system, system-ui, sans-serif';
+      g.fillStyle = '#F2A33C';
+      g.fillText('CHAIN x' + W.chain, ox0, top + 32);
+    }
+
+    // blade charges
+    var full = Math.floor(W.blade);
+    var frac = W.blade - full;
+    var pipW = 15, pipH = 4, gap = 5;
+    var right = ox0 + cell * COLS;
+    for (var i = 0; i < BLADE_MAX; i++){
+      var x = right - (BLADE_MAX - i) * (pipW + gap) + gap;
+      var y = top + 6;
+      g.fillStyle = 'rgba(52,78,110,.55)';
+      g.fillRect(x, y, pipW, pipH);
+      var fillW = i < full ? pipW : (i === full ? pipW * frac : 0);
+      if (fillW > 0){
+        g.fillStyle = i < full ? '#E9F4FF' : 'rgba(233,244,255,.45)';
+        g.fillRect(x, y, fillW, pipH);
+      }
+    }
+  }
+
+  function drawDrag(now){
+    if (!drag || !drag.live) return;
+    var a = drag.a, b = drag.b;
+    var dxp = b.x - a.x, dyp = b.y - a.y;
+    var len = Math.hypot(dxp, dyp);
+    if (len < 8) return;
+
+    var A = toBoard(a.x, a.y), B = toBoard(b.x, b.y);
+    var q = quantAngle(B.x - A.x, B.y - A.y);
+    var hits = wouldCut(A.x, A.y, q.dx, q.dy);
+
+    for (var i = 0; i < hits.length; i++) drawBody(hits[i], now, true);
+
+    // the infinite line, clipped to the visible field
+    var far = 60;
+    var x1 = toScreenX(A.x - q.dx * far), y1 = toScreenY(A.y - q.dy * far);
+    var x2 = toScreenX(A.x + q.dx * far), y2 = toScreenY(A.y + q.dy * far);
+
+    g.save();
+    g.beginPath();
+    g.rect(toScreenX(0), toScreenY(-CHUTE), cell * COLS, cell * (ROWS + CHUTE));
+    g.clip();
+    g.strokeStyle = W.blade >= 1 ? 'rgba(233,244,255,.85)' : 'rgba(232,69,95,.7)';
+    g.lineWidth = 1.5;
+    g.setLineDash([9, 7]);
+    g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+    g.restore();
+  }
+
+  /* ----- loop ----- */
+
+  var last = 0, acc = 0;
+
+  function frame(ts){
+    requestAnimationFrame(frame);
+    if (!last) last = ts;
+    var dt = Math.min((ts - last) / 1000, 0.05);
+    last = ts;
+    var now = ts;
+
+    if (W.running){
+      W.t += dt;
+      W.blade = Math.min(BLADE_MAX, W.blade + dt * 1000 / BLADE_REGEN);
+
+      W.speed = Math.min(6, 2.0 + W.score * 0.00018);
+      W.spawnEvery = Math.max(430, 1000 - W.score * 0.035);
+      W.colors = W.score > 4000 ? 5 : (W.score > 1500 ? 4 : 3);
+
+      if (ts > W.spawnAt){ spawn(); W.spawnAt = ts + W.spawnEvery; }
+
+      var landed = physics(dt);
+      if (landed) weld(now);
+      var cleared = resolveClears();
+      if (!cleared){
+        var allStill = true;
+        for (var i = 0; i < W.bodies.length; i++){
+          if (!W.bodies[i].settled){ allStill = false; break; }
+        }
+        if (allStill) W.chain = 0;
+      }
+
+      for (var k = 0; k < W.bodies.length; k++){
+        var b = W.bodies[k];
+        if (b.settled && b.minY < -EPS){
+          W.running = false; W.over = true;
+          sfx.over();
+          showOver();
+          break;
+        }
+      }
+    }
+
+    g.clearRect(0, 0, VW, VH);
+    g.fillStyle = '#070B12';
+    g.fillRect(0, 0, VW, VH);
+    drawBoard();
+    for (var m = 0; m < W.bodies.length; m++) drawBody(W.bodies[m], now, false);
+    drawSparks(dt);
+    drawDrag(now);
+    if (W.running || W.over) drawHUD();
+  }
+
+  /* ----- input ----- */
+
+  var EDGE = 20;
+
+  function inDeadZone(x, y){
+    return x < EDGE || x > VW - EDGE || y > VH - EDGE;
+  }
+
+  cv.addEventListener('pointerdown', function(e){
+    e.preventDefault();
+    sfx.unlock();
+    if (!W.running){
+      if (W.over || ov.className !== 'hidden'){
+        reset(); hideOverlay(); W.spawnAt = performance.now();
+      }
+      return;
+    }
+    if (inDeadZone(e.clientX, e.clientY)) return;
+    drag = { a: { x: e.clientX, y: e.clientY }, b: { x: e.clientX, y: e.clientY }, live: true, id: e.pointerId };
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  }, { passive: false });
+
+  cv.addEventListener('pointermove', function(e){
+    if (!drag || e.pointerId !== drag.id) return;
+    e.preventDefault();
+    drag.b = { x: e.clientX, y: e.clientY };
+  }, { passive: false });
+
+  function endDrag(e){
+    if (!drag || e.pointerId !== drag.id) return;
+    e.preventDefault();
+    var a = drag.a, b = drag.b;
+    drag = null;
+    var len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len < 24 || !W.running) return;
+    var A = toBoard(a.x, a.y), B = toBoard(b.x, b.y);
+    cut(A.x, A.y, B.x - A.x, B.y - A.y, performance.now());
+  }
+
+  cv.addEventListener('pointerup', endDrag, { passive: false });
+  cv.addEventListener('pointercancel', function(e){ drag = null; }, { passive: false });
+
+  ov.addEventListener('pointerdown', function(e){
+    e.preventDefault();
+    sfx.unlock();
+    reset();
+    hideOverlay();
+    W.spawnAt = performance.now();
+  }, { passive: false });
+
+  document.addEventListener('gesturestart', function(e){ e.preventDefault(); });
+  document.addEventListener('dblclick', function(e){ e.preventDefault(); });
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', function(){ setTimeout(resize, 120); });
+
+  resize();
+  showStart();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- exports for the headless test ---------- */
+if (typeof module !== 'undefined' && module.exports){
+  module.exports = {
+    polyArea: polyArea, polyBounds: polyBounds, clipHalf: clipHalf, tidy: tidy,
+    partProfile: partProfile, makeBody: makeBody, translate: translate, rect: rect,
+    touching: touching, weld: weld, physics: physics, resolveClears: resolveClears,
+    cut: cut, spawn: spawn, reset: reset, W: W, COLS: COLS, ROWS: ROWS, SUBW: SUBW,
+    CLEAR_AREA: CLEAR_AREA, SLIVER: SLIVER
+  };
+}
+
+if (typeof document !== 'undefined') boot();
+
+})();
+</script>
+</body>
+</html>
